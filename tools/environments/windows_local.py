@@ -1,7 +1,7 @@
 """Windows-native execution environment using PowerShell.
 
-Phase 1 MVP: direct PowerShell spawn without bash intermediate.
-No session snapshot (env vars do not persist across commands yet).
+Phase 2: direct PowerShell spawn with session snapshot (env var persistence).
+Env vars set via `$env:FOO = "bar"` or `set FOO=bar` persist across commands.
 """
 
 import logging
@@ -69,16 +69,23 @@ def _quote_ps_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+# Separator used in the env snapshot file.
+# Chosen to be extremely unlikely in env var names or values.
+_ENV_SEP = "\x00"
+
+
 class WindowsLocalEnvironment(BaseEnvironment):
-    """Run commands directly on Windows using PowerShell (no bash)."""
+    """Run commands directly on Windows using PowerShell (no bash).
+
+    Session snapshot preserves environment variables across commands.
+    CWD persists via file-based read after each command.
+    """
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         if cwd:
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
-        # Phase 1: skip init_session — env snapshot not yet implemented for PowerShell.
-        # Commands will run with the current process environment only.
-        self._snapshot_ready = False
+        self.init_session()
 
     def get_temp_dir(self) -> str:
         """Return a writable temp dir for local execution on Windows."""
@@ -92,45 +99,142 @@ class WindowsLocalEnvironment(BaseEnvironment):
         # Keep forward slashes for consistency with BaseEnvironment path handling.
         return candidate.replace("\\", "/").rstrip("/") or "/"
 
+    # ------------------------------------------------------------------
+    # Session snapshot
+    # ------------------------------------------------------------------
+
+    def init_session(self):
+        """Capture initial environment into a snapshot file.
+
+        The snapshot is a UTF-8 text file with NUL-separated key-value pairs,
+        one per line:  NAME\x00VALUE
+        This format handles env values containing newlines, equals signs, etc.
+        """
+        # Build a PowerShell script that dumps all env vars to the snapshot.
+        # We use NUL as separator because it cannot appear in env var names
+        # or values on Windows.
+        quoted_snap = _quote_ps_literal(self._snapshot_path)
+        bootstrap = (
+            "$ProgressPreference = 'SilentlyContinue'\n"
+            # Dump all env vars as KEY\x00VALUE lines
+            "Get-ChildItem Env: | ForEach-Object {\n"
+            f"  \"$($_.Name){_ENV_SEP}$($_.Value)\"\n"
+            "} | Out-File -FilePath " + quoted_snap + " -Encoding utf8\n"
+        )
+        try:
+            proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
+            self._wait_for_process(proc, timeout=self._snapshot_timeout)
+            # Verify the snapshot file is readable
+            self._load_snapshot()
+            self._snapshot_ready = True
+            logger.info(
+                "PowerShell session snapshot created (session=%s, cwd=%s)",
+                self._session_id, self.cwd,
+            )
+        except Exception as exc:
+            logger.warning(
+                "init_session failed (session=%s): %s — "
+                "env vars will not persist across commands",
+                self._session_id, exc,
+            )
+            self._snapshot_ready = False
+
+    def _load_snapshot(self) -> dict:
+        """Load the env snapshot file into a dict."""
+        env = {}
+        try:
+            with open(self._snapshot_path, encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.rstrip("\n\r")
+                    if not line:
+                        continue
+                    parts = line.split(_ENV_SEP, 1)
+                    if len(parts) == 2:
+                        env[parts[0]] = parts[1]
+        except (OSError, FileNotFoundError):
+            pass
+        return env
+
+    def _save_snapshot(self, env: dict) -> None:
+        """Write env dict back to the snapshot file (BOM-free UTF-8)."""
+        try:
+            with open(self._snapshot_path, "w", encoding="utf-8") as f:
+                for key, value in env.items():
+                    f.write(f"{key}{_ENV_SEP}{value}\n")
+        except OSError as exc:
+            logger.debug("Failed to save env snapshot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Command wrapping
+    # ------------------------------------------------------------------
+
     def _wrap_command(self, command: str, cwd: str) -> str:
-        """Build a PowerShell script that cd's, runs the command, and emits CWD."""
+        """Build a PowerShell script that restores env, cd's, runs command,
+        re-dumps env vars, saves CWD, and emits CWD marker."""
         quoted_cwd = _quote_ps_literal(cwd)
         quoted_cwd_file = _quote_ps_literal(self._cwd_file)
+        quoted_snap = _quote_ps_literal(self._snapshot_path)
         marker = self._cwd_marker
 
-        # Use a here-string so the user's command needs almost no escaping.
-        # The only thing that breaks a here-string is '@' at the start of a
-        # line immediately followed by a single quote. That's vanishingly rare.
-        #
-        # $ProgressPreference suppresses CLIXML noise from PowerShell 5.1's
-        # first-run module-initialization progress bars.
-        # Write CWD via [IO.File]::WriteAllText() — avoids the UTF-8 BOM that
-        # PowerShell 5.1's Out-File -Encoding utf8 injects.  The BOM (\ufeff)
-        # poisons self.cwd and breaks Set-Location on the next call.
-        quoted_cwd_file_bare = self._cwd_file.replace("\\", "/")
+        # --- Restore env from snapshot ---
+        restore_env = ""
+        if self._snapshot_ready:
+            # Read the snapshot file line by line, split on NUL, set $env:
+            # Using -Raw + split is faster than Get-Content for large files.
+            restore_env = (
+                f"if (Test-Path {quoted_snap}) {{\n"
+                f"  $__snap = [IO.File]::ReadAllText({quoted_snap}, [System.Text.UTF8Encoding]::new($false))\n"
+                f"  $__snap -split \"`n\" | ForEach-Object {{\n"
+                f"    $__parts = $_ -split [char]0, 2\n"
+                f"    if ($__parts.Length -eq 2 -and $__parts[0]) {{\n"
+                f"      Set-Item -Path \"Env:$($__parts[0])\" -Value $__parts[1] -ErrorAction SilentlyContinue\n"
+                f"    }}\n"
+                f"  }}\n"
+                f"}}\n"
+            )
+
+        # --- Dump env back to snapshot after command ---
+        dump_env = ""
+        if self._snapshot_ready:
+            # Collect env lines into a variable, then write all at once.
+            # Can't pipe directly into [IO.File]::WriteAllLines (PS parser error).
+            dump_env = (
+                "$__envLines = Get-ChildItem Env: | ForEach-Object {\n"
+                f"  \"$($_.Name){_ENV_SEP}$($_.Value)\"\n"
+                "}\n"
+                f"[IO.File]::WriteAllLines({quoted_snap}, $__envLines, [System.Text.UTF8Encoding]::new($false))\n"
+            )
+
         ps_script = (
             f"$ProgressPreference = 'SilentlyContinue'\n"
-            # Override Get-Location / pwd to emit the path string to stdout.
-            # In -NonInteractive -File mode, Get-Location returns a PathInfo
-            # object that does NOT flow to stdout (unlike interactive mode).
-            # Replacing it with a function that explicitly Write-Output's the
-            # path string makes ``Get-Location`` and ``pwd`` behave as users
-            # expect when called through hermes.
+            # Override Get-Location / pwd to emit path string to stdout
             f"Remove-Item Alias:pwd -ErrorAction SilentlyContinue\n"
             f"function pwd {{ Write-Output (Microsoft.PowerShell.Management\\Get-Location).Path }}\n"
             f"function Get-Location {{ Write-Output (Microsoft.PowerShell.Management\\Get-Location).Path }}\n"
+            # Restore env vars from snapshot
+            f"{restore_env}"
+            # cd to working directory
             f"Set-Location -LiteralPath {quoted_cwd}\n"
+            # Run user command via here-string
             f"$__cmd = @'\n"
             f"{command}\n"
             f"'@\n"
             f"Invoke-Expression $__cmd\n"
             f"$__hermes_ec = $LASTEXITCODE\n"
             f"if ($__hermes_ec -eq $null) {{ $__hermes_ec = 0 }}\n"
+            # Save CWD
             f"[IO.File]::WriteAllText({quoted_cwd_file}, (Microsoft.PowerShell.Management\\Get-Location).Path, [System.Text.UTF8Encoding]::new($false))\n"
+            # Re-dump env vars to snapshot
+            f"{dump_env}"
+            # CWD marker
             f'Write-Output "`n{marker}$((Microsoft.PowerShell.Management\\Get-Location).Path){marker}"\n'
             f"exit $__hermes_ec\n"
         )
         return ps_script
+
+    # ------------------------------------------------------------------
+    # Process spawning
+    # ------------------------------------------------------------------
 
     def _run_bash(
         self,
@@ -181,6 +285,10 @@ class WindowsLocalEnvironment(BaseEnvironment):
 
         return proc
 
+    # ------------------------------------------------------------------
+    # Process lifecycle
+    # ------------------------------------------------------------------
+
     def _kill_process(self, proc):
         """Kill the process and its children on Windows."""
         try:
@@ -196,6 +304,10 @@ class WindowsLocalEnvironment(BaseEnvironment):
             )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # CWD tracking
+    # ------------------------------------------------------------------
 
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed).
@@ -246,8 +358,6 @@ class WindowsLocalEnvironment(BaseEnvironment):
             line_end = len(output)
 
         # Only strip if the line contains NOTHING but the marker.
-        # The injected line is: \n__MARKER__path__MARKER__\n
-        # If line_start == -1, the marker is at the very beginning of output.
         marker_line = output[line_start + 1 : line_end].strip() if line_start != -1 else output[:line_end].strip()
 
         # Verify this line is a pure marker (starts and ends with the marker tag)
@@ -256,6 +366,10 @@ class WindowsLocalEnvironment(BaseEnvironment):
                 result["output"] = output[:line_start] + output[line_end:]
             else:
                 result["output"] = output[line_end:]
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
     def cleanup(self):
         """Clean up temp files."""
