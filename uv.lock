@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer = "2026-04-22T20:28:06.1942621Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -1954,7 +1954,7 @@ wheels = [
 
 [[package]]
 name = "hermes-agent"
-version = "0.12.0"
+version = "0.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
