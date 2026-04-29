@@ -110,6 +110,15 @@ class WindowsLocalEnvironment(BaseEnvironment):
         quoted_cwd_file_bare = self._cwd_file.replace("\\", "/")
         ps_script = (
             f"$ProgressPreference = 'SilentlyContinue'\n"
+            # Override Get-Location / pwd to emit the path string to stdout.
+            # In -NonInteractive -File mode, Get-Location returns a PathInfo
+            # object that does NOT flow to stdout (unlike interactive mode).
+            # Replacing it with a function that explicitly Write-Output's the
+            # path string makes ``Get-Location`` and ``pwd`` behave as users
+            # expect when called through hermes.
+            f"Remove-Item Alias:pwd -ErrorAction SilentlyContinue\n"
+            f"function pwd {{ Write-Output (Microsoft.PowerShell.Management\\Get-Location).Path }}\n"
+            f"function Get-Location {{ Write-Output (Microsoft.PowerShell.Management\\Get-Location).Path }}\n"
             f"Set-Location -LiteralPath {quoted_cwd}\n"
             f"$__cmd = @'\n"
             f"{command}\n"
@@ -117,8 +126,8 @@ class WindowsLocalEnvironment(BaseEnvironment):
             f"Invoke-Expression $__cmd\n"
             f"$__hermes_ec = $LASTEXITCODE\n"
             f"if ($__hermes_ec -eq $null) {{ $__hermes_ec = 0 }}\n"
-            f"[IO.File]::WriteAllText({quoted_cwd_file}, (Get-Location).Path, [System.Text.UTF8Encoding]::new($false))\n"
-            f'Write-Output "`n{marker}$((Get-Location).Path){marker}"\n'
+            f"[IO.File]::WriteAllText({quoted_cwd_file}, (Microsoft.PowerShell.Management\\Get-Location).Path, [System.Text.UTF8Encoding]::new($false))\n"
+            f'Write-Output "`n{marker}$((Microsoft.PowerShell.Management\\Get-Location).Path){marker}"\n'
             f"exit $__hermes_ec\n"
         )
         return ps_script
@@ -202,8 +211,51 @@ class WindowsLocalEnvironment(BaseEnvironment):
         except (OSError, FileNotFoundError):
             pass
 
-        # Still strip the marker from output so it's not visible to the user.
-        self._extract_cwd_from_output(result)
+        # Strip the CWD marker from output using a precise line-based approach
+        # that preserves normal command output (e.g. Get-Location output).
+        self._strip_cwd_marker(result)
+
+    def _strip_cwd_marker(self, result: dict):
+        """Remove the CWD marker line from output without touching command output.
+
+        The marker line is always the LAST line of output and has the format:
+            __HERMES_CWD_{id}__{path}__HERMES_CWD_{id}__
+
+        We only remove that exact line, preserving everything above it — even
+        if the command output (like Get-Location) prints the same path on the
+        preceding line.
+        """
+        output = result.get("output", "")
+        marker = self._cwd_marker
+        last = output.rfind(marker)
+        if last == -1:
+            return
+
+        # Find the closing marker
+        first = output.rfind(marker, max(0, last - 4096), last)
+        if first == -1 or first == last:
+            return
+
+        # Find the start of the marker line (the \n we injected before it)
+        line_start = output.rfind("\n", 0, first)
+        # Find the end of the marker line
+        line_end = output.find("\n", last + len(marker))
+        if line_end != -1:
+            line_end += 1  # include the trailing newline
+        else:
+            line_end = len(output)
+
+        # Only strip if the line contains NOTHING but the marker.
+        # The injected line is: \n__MARKER__path__MARKER__\n
+        # If line_start == -1, the marker is at the very beginning of output.
+        marker_line = output[line_start + 1 : line_end].strip() if line_start != -1 else output[:line_end].strip()
+
+        # Verify this line is a pure marker (starts and ends with the marker tag)
+        if marker_line.startswith(marker) and marker_line.endswith(marker):
+            if line_start != -1:
+                result["output"] = output[:line_start] + output[line_end:]
+            else:
+                result["output"] = output[line_end:]
 
     def cleanup(self):
         """Clean up temp files."""
