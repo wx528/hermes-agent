@@ -207,8 +207,17 @@ def _find_bash() -> str:
     )
 
 
-# Backward compat — process_registry.py imports this name
+    # Backward compat — process_registry.py imports this name
 _find_shell = _find_bash
+
+
+def _quote_path_for_shell(path: str) -> str:
+    """Quote a path for shell redirection so spaces survive.
+
+    Used for snapshot_path and cwd_file which may live under
+    C:/Users/<user name>/AppData/Local/Temp on Windows.
+    """
+    return shlex.quote(path.replace("\\", "/"))
 
 
 # Standard PATH entries for environments with minimal PATH.
@@ -353,10 +362,16 @@ class LocalEnvironment(BaseEnvironment):
         Unix systems, and only fall back to tempfile.gettempdir() when it also
         resolves to a POSIX path.
 
-        Check the environment configured for this backend first so callers can
-        override the temp root explicitly (for example via terminal.env or a
-        custom TMPDIR), then fall back to the host process environment.
+        On Windows we return a forward-slashed path so bash and Python agree
+        on the same file (Git Bash maps e.g. C:/Users/…/Temp to /tmp, but
+        we want an explicit absolute path both sides can read/write).
         """
+        if _IS_WINDOWS:
+            candidate = self.env.get("TEMP") or self.env.get("TMP") or os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir()
+            # Git Bash understands C:/foo; forward slashes keep bash scripts
+            # from treating backslashes as escape sequences.
+            return candidate.replace("\\", "/").rstrip("/") or "/"
+
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate and candidate.startswith("/"):

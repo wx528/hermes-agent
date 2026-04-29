@@ -13,6 +13,7 @@ import os
 import select
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -339,15 +340,17 @@ class BaseEnvironment(ABC):
         # change the working directory (e.g. bashrc `cd ~`).  Without this,
         # pwd -P captures the profile's directory, not terminal.cwd.
         _quoted_cwd = shlex.quote(self.cwd)
+        _snap = shlex.quote(self._snapshot_path)
+        _cwd_f = shlex.quote(self._cwd_file)
         bootstrap = (
-            f"export -p > {self._snapshot_path}\n"
-            f"declare -f | grep -vE '^_[^_]' >> {self._snapshot_path}\n"
-            f"alias -p >> {self._snapshot_path}\n"
-            f"echo 'shopt -s expand_aliases' >> {self._snapshot_path}\n"
-            f"echo 'set +e' >> {self._snapshot_path}\n"
-            f"echo 'set +u' >> {self._snapshot_path}\n"
+            f"export -p > {_snap}\n"
+            f"declare -f | grep -vE '^_[^_]' >> {_snap}\n"
+            f"alias -p >> {_snap}\n"
+            f"echo 'shopt -s expand_aliases' >> {_snap}\n"
+            f"echo 'set +e' >> {_snap}\n"
+            f"echo 'set +u' >> {_snap}\n"
             f"builtin cd {_quoted_cwd} 2>/dev/null || true\n"
-            f"pwd -P > {self._cwd_file} 2>/dev/null || true\n"
+            f"pwd -P > {_cwd_f} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
         try:
@@ -397,9 +400,12 @@ class BaseEnvironment(ABC):
         # can emit the declarations to stdout, leaking ~60 lines of env
         # vars into every tool response (issue #15459).  Linux bash is
         # silent here, but the redirect is harmless.
+        _snap = shlex.quote(self._snapshot_path)
+        _cwd_f = shlex.quote(self._cwd_file)
+
         if self._snapshot_ready:
             parts.append(
-                f"source {self._snapshot_path} >/dev/null 2>&1 || true"
+                f"source {_snap} >/dev/null 2>&1 || true"
             )
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
@@ -414,10 +420,10 @@ class BaseEnvironment(ABC):
 
         # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
         if self._snapshot_ready:
-            parts.append(f"export -p > {self._snapshot_path} 2>/dev/null || true")
+            parts.append(f"export -p > {_snap} 2>/dev/null || true")
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)
-        parts.append(f"pwd -P > {self._cwd_file} 2>/dev/null || true")
+        parts.append(f"pwd -P > {_cwd_f} 2>/dev/null || true")
         # Use a distinct line for the marker. The leading \n ensures
         # the marker starts on its own line even if the command doesn't
         # end with a newline (e.g. printf 'exact'). We'll strip this
@@ -492,6 +498,22 @@ class BaseEnvironment(ABC):
             idle_after_exit = 0
             try:
                 while True:
+                    # Windows: select.select() does not support pipe fds.
+                    # Use the TextIOWrapper's underlying buffer for blocking
+                    # reads in this daemon thread.  On Windows there is no
+                    # fork(), so grandchild pipe-inheritance hangs are far
+                    # less common; a blocking read terminates naturally when
+                    # the subprocess exits and the pipe closes.
+                    if sys.platform == "win32":
+                        try:
+                            chunk = proc.stdout.buffer.read(4096)
+                        except (ValueError, OSError):
+                            break
+                        if not chunk:
+                            break
+                        output_chunks.append(decoder.decode(chunk))
+                        continue
+
                     try:
                         ready, _, _ = select.select([fd], [], [], 0.1)
                     except (ValueError, OSError):
