@@ -70,8 +70,17 @@ def _quote_ps_literal(value: str) -> str:
 
 
 # Separator used in the env snapshot file.
-# Chosen to be extremely unlikely in env var names or values.
-_ENV_SEP = "\x00"
+#
+# We need a character that:
+#   1. Cannot appear in Windows env var names or values (rules out =, ;, etc.)
+#   2. Is safe inside a .ps1 file (rules out \x00 NUL — PS parser truncates;
+#      \x01 SOH also causes intermittent issues on PS 5.1)
+#   3. Survives round-trip through [IO.File]::WriteAllText / ReadAllText
+#
+# The sequence \x02\x03 (STX + ETX) satisfies all three: control chars are
+# illegal in Windows env var names/values, and the two-byte sequence is
+# astronomically unlikely to appear in any value by accident.
+_ENV_SEP = "\x02\x03"
 
 
 class WindowsLocalEnvironment(BaseEnvironment):
@@ -116,10 +125,15 @@ class WindowsLocalEnvironment(BaseEnvironment):
         quoted_snap = _quote_ps_literal(self._snapshot_path)
         bootstrap = (
             "$ProgressPreference = 'SilentlyContinue'\n"
-            # Dump all env vars as KEY\x00VALUE lines
-            "Get-ChildItem Env: | ForEach-Object {\n"
+            # Dump all env vars as KEY\x00VALUE lines using BOM-free UTF-8 write.
+            # Out-File -Encoding utf8 on PS5.1 adds a BOM and strips NUL chars,
+            # which destroys the NUL separator — the exact bug that caused env
+            # snapshot restore to corrupt the subprocess environment.
+            "$__envLines = Get-ChildItem Env: | ForEach-Object {\n"
             f"  \"$($_.Name){_ENV_SEP}$($_.Value)\"\n"
-            "} | Out-File -FilePath " + quoted_snap + " -Encoding utf8\n"
+            "}\n"
+            f"[IO.File]::WriteAllLines({quoted_snap}, $__envLines, "
+            "[System.Text.UTF8Encoding]::new($false))\n"
         )
         try:
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
@@ -179,15 +193,20 @@ class WindowsLocalEnvironment(BaseEnvironment):
         # --- Restore env from snapshot ---
         restore_env = ""
         if self._snapshot_ready:
-            # Read the snapshot file line by line, split on NUL, set $env:
+            # Read the snapshot file line by line, split on separator, set $env:
             # Using -Raw + split is faster than Get-Content for large files.
+            # We embed the separator bytes into the script via PowerShell
+            # string interpolation so the .ps1 file itself never contains
+            # raw control characters.
             restore_env = (
                 f"if (Test-Path {quoted_snap}) {{\n"
                 f"  $__snap = [IO.File]::ReadAllText({quoted_snap}, [System.Text.UTF8Encoding]::new($false))\n"
+                f"  $__sep = [string]::new([char[]]@({', '.join(str(ord(c)) for c in _ENV_SEP)}))\n"
                 f"  $__snap -split \"`n\" | ForEach-Object {{\n"
-                f"    $__parts = $_ -split [char]0, 2\n"
+                f"    $__parts = $_ -split [regex]::Escape($__sep), 2\n"
                 f"    if ($__parts.Length -eq 2 -and $__parts[0]) {{\n"
-                f"      Set-Item -Path \"Env:$($__parts[0])\" -Value $__parts[1] -ErrorAction SilentlyContinue\n"
+                f"      $__val = $__parts[1].TrimEnd([char]13)\n"
+                f"      Set-Item -Path \"Env:$($__parts[0])\" -Value $__val -ErrorAction SilentlyContinue\n"
                 f"    }}\n"
                 f"  }}\n"
                 f"}}\n"
@@ -198,9 +217,13 @@ class WindowsLocalEnvironment(BaseEnvironment):
         if self._snapshot_ready:
             # Collect env lines into a variable, then write all at once.
             # Can't pipe directly into [IO.File]::WriteAllLines (PS parser error).
+            # Build separator in-script via char codes so the .ps1 file never
+            # contains raw control characters that might trip up PS 5.1.
+            sep_char_codes = ", ".join(str(ord(c)) for c in _ENV_SEP)
             dump_env = (
+                f"$__sep = [string]::new([char[]]@({sep_char_codes}))\n"
                 "$__envLines = Get-ChildItem Env: | ForEach-Object {\n"
-                f"  \"$($_.Name){_ENV_SEP}$($_.Value)\"\n"
+                f"  \"$($_.Name)$__sep$($_.Value)\"\n"
                 "}\n"
                 f"[IO.File]::WriteAllLines({quoted_snap}, $__envLines, [System.Text.UTF8Encoding]::new($false))\n"
             )
