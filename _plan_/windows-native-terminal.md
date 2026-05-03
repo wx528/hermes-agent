@@ -2,73 +2,74 @@
 
 Branch: `feature/windows-native-terminal`
 
-## 目标
+## Goal
 
-让 Hermes 在 Windows 上摆脱 Git Bash 中间层，直接使用 PowerShell 原生执行命令，
-借鉴 OpenClaw 的 Windows 策略：承认 Windows 不是 POSIX，用平台原生 shell。
+Make Hermes on Windows shed the Git Bash middleware and execute commands directly
+through PowerShell natively, following OpenClaw's Windows strategy: acknowledge
+that Windows is not POSIX, and use the platform's native shell.
 
-## 进度
+## Progress
 
-### Phase 0: Windows 基础补丁 ✅
+### Phase 0: Windows Foundation Patches ✅
 
-| 改动 | 文件 | 说明 |
-|------|------|------|
-| `select.select` 修复 | `base.py` | Windows 用 `stdout.buffer.read()` 替代 `select.select` |
-| `shlex.quote` 路径 | `base.py` | snapshot/cwd 文件路径加引号（Windows 用户目录有空格） |
-| `get_temp_dir()` | `local.py` | Windows 返回 `TEMP` 路径而非 `/tmp` |
+| Change | File | Description |
+|--------|------|-------------|
+| `select.select` fix | `base.py` | Use `stdout.buffer.read()` instead of `select.select` on Windows |
+| `shlex.quote` paths | `base.py` | Quote snapshot/cwd file paths (Windows user dirs contain spaces) |
+| `get_temp_dir()` | `local.py` | Return `TEMP` path on Windows instead of `/tmp` |
 
-Commit: `50ff3f82` (合并在 Phase 1 提交中)
+Commit: `50ff3f82` (merged into Phase 1 commit)
 
 ### Phase 1: WindowsLocalEnvironment ✅
 
-| 改动 | 文件 | 说明 |
-|------|------|------|
-| 新建 WindowsLocalEnvironment | `windows_local.py` | 直接 spawn PowerShell，不经过 bash |
-| PowerShell 查找优先级 | `windows_local.py` | pwsh7 → powershell5.1 |
-| BOM 安全 CWD 写入 | `windows_local.py` | `[IO.File]::WriteAllText` + `utf-8-sig` 读取 |
-| 进程终止 | `windows_local.py` | `taskkill /T /F /PID` |
-| CLIXML 噪音抑制 | `windows_local.py` | `$ProgressPreference = 'SilentlyContinue'` |
-| 路由改造 | `terminal_tool.py` | Windows → `_WindowsLocalEnvironment` |
-| 回退开关 | `terminal_tool.py` | `HERMES_USE_GIT_BASH=1` 回退旧模式 |
-| hermes.ps1 | `hermes.ps1` | 注释掉 `HERMES_GIT_BASH_PATH` |
-| hermes.cmd | `hermes.cmd` | cmd.exe 版启动器 |
+| Change | File | Description |
+|--------|------|-------------|
+| New WindowsLocalEnvironment | `windows_local.py` | Spawn PowerShell directly, bypassing bash |
+| PowerShell lookup priority | `windows_local.py` | pwsh7 → powershell5.1 |
+| BOM-safe CWD write | `windows_local.py` | `[IO.File]::WriteAllText` + `utf-8-sig` read |
+| Process termination | `windows_local.py` | `taskkill /T /F /PID` |
+| CLIXML noise suppression | `windows_local.py` | `$ProgressPreference = 'SilentlyContinue'` |
+| Routing change | `terminal_tool.py` | Windows → `_WindowsLocalEnvironment` |
+| Fallback switch | `terminal_tool.py` | `HERMES_USE_GIT_BASH=1` reverts to legacy mode |
+| hermes.ps1 | `hermes.ps1` | Comment out `HERMES_GIT_BASH_PATH` |
+| hermes.cmd | `hermes.cmd` | cmd.exe launcher |
 
 Commits: `50ff3f82`, `82e1ac32`, `367417a0`
 
-关键修复：
-- BOM 污染 cwd → `NotADirectoryError`（`Out-File -Encoding utf8` 在 PS5.1 写 BOM）
-- `Get-Location`/`pwd` 在 `-NonInteractive -File` 模式不输出 → Override 为 `Write-Output`
+Key fixes:
+- BOM contaminating cwd → `NotADirectoryError` (`Out-File -Encoding utf8` writes BOM on PS5.1)
+- `Get-Location`/`pwd` produces no output in `-NonInteractive -File` mode → Override with `Write-Output`
 
 ### Phase 2: PowerShell Env Snapshot ✅
 
-| 改动 | 文件 | 说明 |
-|------|------|------|
-| `init_session()` | `windows_local.py` | 首次启动捕获环境变量到 NUL 分隔的快照文件 |
-| `_wrap_command()` 恢复环境 | `windows_local.py` | 每次命令前从快照恢复 `$env:` |
-| `_wrap_command()` 重导出环境 | `windows_local.py` | 每次命令后重新导出到快照（捕获新变量） |
-| BOM-free 写入 | `windows_local.py` | `[IO.File]::WriteAllText/WriteAllLines` + `UTF8Encoding($false)` |
+| Change | File | Description |
+|--------|------|-------------|
+| `init_session()` | `windows_local.py` | Capture environment variables to NUL-delimited snapshot file on first launch |
+| `_wrap_command()` restore env | `windows_local.py` | Restore `$env:` from snapshot before each command |
+| `_wrap_command()` re-export env | `windows_local.py` | Re-export to snapshot after each command (captures new variables) |
+| BOM-free write | `windows_local.py` | `[IO.File]::WriteAllText/WriteAllLines` + `UTF8Encoding($false)` |
 
 Commit: `8446226b`
 
-测试验证：
-- `$env:MY_VAR = "hello hermes"` → 跨命令保持 ✅
+Test verification:
+- `$env:MY_VAR = "hello hermes"` → persists across commands ✅
 - `Write-Output $env:MY_VAR` → `hello hermes` ✅
 - `Get-Location` → `D:\Agents\hermes-agent` ✅
 - `Set-Location C:\Users` + `Get-Location` → `C:\Users` ✅
 
-### Phase 3: BaseEnvironment 去 Bash 化 (待做)
+### Phase 3: De-bash BaseEnvironment (TODO)
 
-目标：把 `BaseEnvironment` 从 "bash 专属" 重构为 "通用执行框架"。
+Goal: Refactor `BaseEnvironment` from "bash-specific" to "generic execution framework".
 
-**3.1 重命名/抽象化**
+**3.1 Rename / Abstract**
 
 ```
 _run_bash(...)      →  _spawn(self, script, ...) -> ProcessHandle
 _wrap_command(...)  →  _build_script(self, command, cwd) -> str
-init_session()      →  保持，子类负责具体实现
+init_session()      →  Keep as-is; subclasses handle concrete implementation
 ```
 
-**3.2 引入 ShellBackend 策略**
+**3.2 Introduce ShellBackend Strategy**
 
 ```python
 class ShellBackend(ABC):
@@ -85,15 +86,15 @@ class LocalEnvironment(BaseEnvironment):
         self._shell = PowerShellBackend() if _IS_WINDOWS else BashBackend()
 ```
 
-**3.3 测试要求**
+**3.3 Test Requirements**
 
-- Unix 回归测试：所有 bash 路径行为不变
-- Windows 测试：所有 PowerShell 路径行为不变
-- 远程后端（Docker/SSH/Modal）不受影响
+- Unix regression: all bash-path behavior unchanged
+- Windows: all PowerShell-path behavior unchanged
+- Remote backends (Docker/SSH/Modal) unaffected
 
-### Phase 4: Windows 编码与 .cmd Shim (待做)
+### Phase 4: Windows Encoding & .cmd Shim (TODO)
 
-**4.1 编码自动检测**
+**4.1 Encoding Auto-Detection**
 
 ```python
 # tools/environments/windows_encoding.py
@@ -108,14 +109,14 @@ def resolve_windows_console_encoding() -> str | None:
     ...
 ```
 
-借鉴 OpenClaw 的 `windows-encoding.ts`：
-- 运行时查 `chcp` 获取代码页
-- 用 `TextDecoder` 做流式解码
-- 处理 GBK 字符被拆分成多个 chunk 的情况
+Inspired by OpenClaw's `windows-encoding.ts`:
+- Query `chcp` at runtime for the codepage
+- Use `TextDecoder` for streaming decode
+- Handle GBK characters split across multiple chunks
 
-**4.2 .cmd 命令解析**
+**4.2 .cmd Command Resolution**
 
-类似 OpenClaw 的 `resolveNpmArgvForWindows`：
+Similar to OpenClaw's `resolveNpmArgvForWindows`:
 
 ```python
 def resolve_windows_argv(argv: list[str]) -> list[str]:
@@ -126,42 +127,42 @@ def resolve_windows_argv(argv: list[str]) -> list[str]:
     """
 ```
 
-解决 Node.js CVE-2024-27980：直接 spawn `.cmd` 文件可能导致 EINVAL。
+Addresses Node.js CVE-2024-27980: directly spawning `.cmd` files can cause EINVAL.
 
-### Phase 5: 清理 (待做)
+### Phase 5: Cleanup (TODO)
 
-| 任务 | 说明 |
-|------|------|
-| 删除 `HERMES_GIT_BASH_PATH` | Windows 不再需要 Git Bash |
-| 删除 `_find_bash` Windows 分支 | 不再找 bash |
-| 文档更新 | README 中 "Windows not supported" 改为支持说明 |
-| 测试覆盖 | Windows spawn、编码、exit code、.cmd shim |
+| Task | Description |
+|------|-------------|
+| Remove `HERMES_GIT_BASH_PATH` | No longer needed on Windows |
+| Remove `_find_bash` Windows branch | No longer searching for bash |
+| Documentation update | Change "Windows not supported" in README to supported |
+| Test coverage | Windows spawn, encoding, exit code, .cmd shim |
 
-## 回退方案
+## Fallback Plan
 
-任何时候设 `HERMES_USE_GIT_BASH=1` 即可回退到旧的 Git Bash 模式：
+Set `HERMES_USE_GIT_BASH=1` at any time to revert to the legacy Git Bash mode:
 
 ```powershell
 $env:HERMES_USE_GIT_BASH=1
 .\hermes.ps1
 ```
 
-## 参考架构
+## Architecture Reference
 
 ```
-当前 (Phase 1-2 完成):
+Current (Phase 1-2 complete):
   terminal_tool → WindowsLocalEnvironment → PowerShell (spawn-per-call)
-                                             ↑ env snapshot 恢复/重导出
+                                             ↑ env snapshot restore/re-export
 
-目标 (Phase 3-4):
+Target (Phase 3-4):
   terminal_tool → LocalEnvironment → ShellBackend (Bash/PowerShell)
-                                     ↑ 统一接口，平台自适应
+                                     ↑ unified interface, platform-adaptive
 ```
 
-## 已知问题
+## Known Issues
 
-1. `Get-Location` 输出被 marker 剥离逻辑吃掉 → 已修复（override 为 Write-Output）
-2. PowerShell 5.1 BOM 污染 cwd → 已修复（BOM-free 写入 + utf-8-sig 读取）
-3. `python` 命令可能触发 Windows Store stub → 待 Phase 4 处理
-4. GBK 编码的命令输出可能乱码 → 待 Phase 4 编码检测
-5. 每次命令 env dump 包含所有环境变量，大环境下可能较慢 → 可优化为增量 diff
+1. `Get-Location` output consumed by marker-stripping logic → Fixed (override with Write-Output)
+2. PowerShell 5.1 BOM contaminating cwd → Fixed (BOM-free write + utf-8-sig read)
+3. `python` command may trigger Windows Store stub → Deferred to Phase 4
+4. GBK-encoded command output may garble → Deferred to Phase 4 encoding detection
+5. Per-command env dump includes all variables; may be slow with large environments → Can optimize with incremental diff
