@@ -12,6 +12,7 @@ from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
+    PowerShellFileOperations,
     normalize_read_pagination,
     normalize_search_pagination,
 )
@@ -428,8 +429,15 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             _start_cleanup_thread()
             logger.info("%s environment ready for task %s", env_type, task_id[:8])
 
-    # Build file_ops from the (guaranteed live) environment and cache it
-    file_ops = ShellFileOperations(terminal_env)
+    # Build file_ops from the (guaranteed live) environment and cache it.
+    # On Windows with native PowerShell backend, use PowerShellFileOperations
+    # which replaces Unix shell commands (sed, cat, wc, etc.) with Python APIs.
+    import sys as _sys
+    from tools.environments.windows_local import WindowsLocalEnvironment as _WinEnv
+    if _sys.platform == "win32" and isinstance(terminal_env, _WinEnv):
+        file_ops = PowerShellFileOperations(terminal_env)
+    else:
+        file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
     return file_ops
