@@ -27,6 +27,7 @@ Usage:
 
 import os
 import re
+import shutil
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1255,3 +1256,475 @@ class ShellFileOperations(FileOperations):
                 total_count=total,
                 truncated=total > offset + limit
             )
+
+
+# =============================================================================
+# Windows Native Implementation
+# =============================================================================
+
+class PowerShellFileOperations(ShellFileOperations):
+    """File operations using Python native APIs instead of Unix shell commands.
+
+    On Windows, ``sed``, ``cat``, ``wc``, ``head``, ``ls``, ``rm``, ``mv``,
+    ``mkdir``, ``test``, and ``command`` are not available in the native
+    PowerShell environment.  This subclass overrides every method that relies
+    on those commands, using ``os`` / ``shutil`` / built-in file I/O instead.
+
+    Methods that *already* work cross-platform (e.g. ripgrep search when
+    ``rg`` is on PATH) are inherited unchanged.
+    """
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve(path: str) -> str:
+        """Resolve a path to absolute, expanding ~ via os.path.expanduser."""
+        return os.path.abspath(os.path.expanduser(path))
+
+    def _has_command(self, cmd: str) -> bool:
+        """Check if a command exists (uses shutil.which, not ``command -v``)."""
+        if cmd not in self._command_cache:
+            self._command_cache[cmd] = shutil.which(cmd) is not None
+        return self._command_cache[cmd]
+
+    def _expand_path(self, path: str) -> str:
+        """Expand ~ and shell-style paths using Python, not ``echo $HOME``."""
+        if not path:
+            return path
+        return os.path.expanduser(path)
+
+    # ------------------------------------------------------------------
+    # READ
+    # ------------------------------------------------------------------
+
+    def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
+        path = self._resolve(self._expand_path(path))
+        offset, limit = normalize_read_pagination(offset, limit)
+
+        if not os.path.isfile(path):
+            return self._suggest_similar_files(path)
+
+        file_size = os.path.getsize(path)
+
+        if self._is_image(path):
+            return ReadResult(
+                is_image=True, is_binary=True, file_size=file_size,
+                hint="Image file detected. Automatically redirected to vision_analyze tool. "
+                     "Use vision_analyze with this file path to inspect the image contents.",
+            )
+
+        # Binary detection: read first 1000 bytes
+        try:
+            with open(path, "rb") as f:
+                sample = f.read(1000)
+        except OSError as e:
+            return ReadResult(error=f"Failed to read file: {e}")
+
+        if self._is_likely_binary(path, sample.decode("utf-8", errors="replace")[:1000]):
+            return ReadResult(
+                is_binary=True, file_size=file_size,
+                error="Binary file - cannot display as text. Use appropriate tools to handle this file type.",
+            )
+
+        # Read lines with pagination
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+        except OSError as e:
+            return ReadResult(error=f"Failed to read file: {e}")
+
+        total_lines = len(all_lines)
+        end_line = offset + limit - 1
+        selected = all_lines[offset - 1 : end_line]
+        content = "".join(selected)
+
+        truncated = total_lines > end_line
+        hint = None
+        if truncated:
+            hint = f"Use offset={end_line + 1} to continue reading (showing {offset}-{end_line} of {total_lines} lines)"
+
+        return ReadResult(
+            content=self._add_line_numbers(content, offset),
+            total_lines=total_lines,
+            file_size=file_size,
+            truncated=truncated,
+            hint=hint,
+        )
+
+    def read_file_raw(self, path: str) -> ReadResult:
+        path = self._resolve(self._expand_path(path))
+        if not os.path.isfile(path):
+            return self._suggest_similar_files(path)
+        file_size = os.path.getsize(path)
+        if self._is_image(path):
+            return ReadResult(is_image=True, is_binary=True, file_size=file_size)
+        try:
+            with open(path, "rb") as f:
+                sample = f.read(1000)
+        except OSError as e:
+            return ReadResult(error=f"Failed to read file: {e}")
+        if self._is_likely_binary(path, sample.decode("utf-8", errors="replace")[:1000]):
+            return ReadResult(is_binary=True, file_size=file_size,
+                              error="Binary file — cannot display as text.")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            return ReadResult(error=f"Failed to read file: {e}")
+        return ReadResult(content=content, file_size=file_size)
+
+    # ------------------------------------------------------------------
+    # WRITE / DELETE / MOVE
+    # ------------------------------------------------------------------
+
+    def write_file(self, path: str, content: str) -> WriteResult:
+        path = self._resolve(self._expand_path(path))
+        if _is_write_denied(path):
+            return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+
+        parent = os.path.dirname(path)
+        dirs_created = False
+        if parent and not os.path.isdir(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+                dirs_created = True
+            except OSError as e:
+                return WriteResult(error=f"Failed to create directory {parent}: {e}")
+
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+        except OSError as e:
+            return WriteResult(error=f"Failed to write file: {e}")
+
+        bytes_written = os.path.getsize(path)
+        return WriteResult(bytes_written=bytes_written, dirs_created=dirs_created)
+
+    def delete_file(self, path: str) -> WriteResult:
+        path = self._resolve(self._expand_path(path))
+        if _is_write_denied(path):
+            return WriteResult(error=f"Delete denied: {path} is a protected path")
+        try:
+            os.remove(path)
+        except OSError as e:
+            return WriteResult(error=f"Failed to delete {path}: {e}")
+        return WriteResult()
+
+    def move_file(self, src: str, dst: str) -> WriteResult:
+        src = self._resolve(self._expand_path(src))
+        dst = self._resolve(self._expand_path(dst))
+        for p in (src, dst):
+            if _is_write_denied(p):
+                return WriteResult(error=f"Move denied: {p} is a protected path")
+        try:
+            shutil.move(src, dst)
+        except OSError as e:
+            return WriteResult(error=f"Failed to move {src} -> {dst}: {e}")
+        return WriteResult()
+
+    # ------------------------------------------------------------------
+    # PATCH — uses Python read/write instead of ``cat``
+    # ------------------------------------------------------------------
+
+    def patch_replace(self, path: str, old_string: str, new_string: str,
+                      replace_all: bool = False) -> PatchResult:
+        path = self._resolve(self._expand_path(path))
+        if _is_write_denied(path):
+            return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+
+        # Read current content via Python
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            return PatchResult(error=f"Failed to read file: {path}")
+
+        from tools.fuzzy_match import fuzzy_find_and_replace
+        new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+            content, old_string, new_string, replace_all
+        )
+
+        if error or match_count == 0:
+            err_msg = error or f"Could not find match for old_string in {path}"
+            try:
+                from tools.fuzzy_match import format_no_match_hint
+                err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
+            except Exception:
+                pass
+            return PatchResult(error=err_msg)
+
+        # Write back
+        write_result = self.write_file(path, new_content)
+        if write_result.error:
+            return PatchResult(error=f"Failed to write changes: {write_result.error}")
+
+        # Post-write verification
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                verify = f.read()
+        except OSError:
+            return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
+        if verify != new_content:
+            return PatchResult(error=(
+                f"Post-write verification failed for {path}: on-disk content "
+                f"differs from intended write "
+                f"(wrote {len(new_content)} chars, read back {len(verify)}). "
+                "The patch did not persist. Re-read the file and try again."
+            ))
+
+        diff = self._unified_diff(content, new_content, path)
+        lint_result = self._check_lint(path)
+        return PatchResult(
+            success=True, diff=diff, files_modified=[path],
+            lint=lint_result.to_dict() if lint_result else None,
+        )
+
+    # ------------------------------------------------------------------
+    # SEARCH — path-existence checks use os.path instead of ``test -e``
+    # ------------------------------------------------------------------
+
+    def search(self, pattern: str, path: str = ".", target: str = "content",
+               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               output_mode: str = "content", context: int = 0) -> SearchResult:
+        offset, limit = normalize_search_pagination(offset, limit)
+        path = self._resolve(self._expand_path(path))
+
+        if not os.path.exists(path):
+            parent = os.path.dirname(path) or "."
+            basename_query = os.path.basename(path)
+            hint_parts = [f"Path not found: {path}"]
+            if os.path.isdir(parent) and basename_query:
+                try:
+                    entries = os.listdir(parent)
+                except OSError:
+                    entries = []
+                lower_q = basename_query.lower()
+                candidates = []
+                for entry in entries:
+                    le = entry.lower()
+                    if lower_q in le or le in lower_q or le.startswith(lower_q[:3]):
+                        candidates.append(os.path.join(parent, entry))
+                if candidates:
+                    hint_parts.append("Similar paths: " + ", ".join(candidates[:5]))
+            return SearchResult(error=". ".join(hint_parts), total_count=0)
+
+        if target == "files":
+            return self._search_files(pattern, path, limit, offset)
+        else:
+            return self._search_content(pattern, path, file_glob, limit, offset,
+                                        output_mode, context)
+
+    def _suggest_similar_files(self, path: str) -> ReadResult:
+        """Suggest similar files using os.listdir instead of ``ls``."""
+        dir_path = os.path.dirname(path) or "."
+        filename = os.path.basename(path)
+        basename_no_ext = os.path.splitext(filename)[0]
+        ext = os.path.splitext(filename)[1].lower()
+        lower_name = filename.lower()
+
+        try:
+            entries = os.listdir(dir_path)
+        except OSError:
+            entries = []
+
+        scored: list = []
+        for f in entries[:200]:  # cap to avoid slow scoring on huge dirs
+            lf = f.lower()
+            score = 0
+            if lf == lower_name:
+                score = 100
+            elif os.path.splitext(f)[0].lower() == basename_no_ext.lower():
+                score = 90
+            elif lf.startswith(lower_name) or lower_name.startswith(lf):
+                score = 70
+            elif lower_name in lf:
+                score = 60
+            elif lf in lower_name and len(lf) > 2:
+                score = 40
+            elif ext and os.path.splitext(f)[1].lower() == ext:
+                common = set(lower_name) & set(lf)
+                if len(common) >= max(len(lower_name), len(lf)) * 0.4:
+                    score = 30
+            if score > 0:
+                scored.append((score, os.path.join(dir_path, f)))
+
+        scored.sort(key=lambda x: -x[0])
+        similar = [fp for _, fp in scored[:5]]
+
+        return ReadResult(error=f"File not found: {path}", similar_files=similar)
+
+    def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+        """Search for files by name using rg or Python os.walk."""
+        # Prefer rg when available
+        if self._has_command("rg"):
+            search_pattern = pattern.split("/")[-1] if "/" in pattern else pattern
+            if not search_pattern.startswith("*"):
+                glob_pattern = f"*{search_pattern}"
+            else:
+                glob_pattern = search_pattern
+            fetch_limit = limit + offset
+            # Use PowerShell-compatible piping
+            cmd = (
+                f'rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} '
+                f'{self._escape_shell_arg(path)} 2>$null | Select-Object -First {fetch_limit}'
+            )
+            result = self._exec(cmd, timeout=60)
+            all_files = [f for f in result.stdout.strip().split("\n") if f]
+            if not all_files:
+                cmd_plain = (
+                    f'rg --files -g {self._escape_shell_arg(glob_pattern)} '
+                    f'{self._escape_shell_arg(path)} 2>$null | Select-Object -First {fetch_limit}'
+                )
+                result = self._exec(cmd_plain, timeout=60)
+                all_files = [f for f in result.stdout.strip().split("\n") if f]
+            page = all_files[offset : offset + limit]
+            return SearchResult(files=page, total_count=len(all_files),
+                                truncated=len(all_files) >= fetch_limit)
+
+        # Fallback: Python os.walk
+        import fnmatch
+        all_files: list = []
+        search_name = pattern.split("/")[-1] if "/" in pattern else pattern
+        try:
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for fname in files:
+                    if fnmatch.fnmatch(fname, search_name):
+                        all_files.append(os.path.join(root, fname))
+        except OSError:
+            pass
+
+        def _mtime(f: str) -> float:
+            try:
+                return os.path.getmtime(f)
+            except OSError:
+                return 0.0
+
+        all_files.sort(key=_mtime, reverse=True)
+        page = all_files[offset : offset + limit]
+        return SearchResult(files=page, total_count=len(all_files),
+                            truncated=len(all_files) > offset + limit)
+
+    def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
+                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+        """Override rg search to use PowerShell-compatible piping."""
+        cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
+
+        if context > 0:
+            cmd_parts.extend(["-C", str(context)])
+        if file_glob:
+            cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+        if output_mode == "files_only":
+            cmd_parts.append("-l")
+        elif output_mode == "count":
+            cmd_parts.append("-c")
+
+        cmd_parts.append(self._escape_shell_arg(pattern))
+        cmd_parts.append(self._escape_shell_arg(path))
+
+        fetch_limit = limit + offset + 200 if context > 0 else limit + offset
+        # Use PowerShell's Select-Object instead of Unix head
+        cmd = " ".join(cmd_parts) + f" 2>$null | Select-Object -First {fetch_limit}"
+
+        result = self._exec(cmd, timeout=60)
+
+        if result.exit_code == 2 and not result.stdout.strip():
+            return SearchResult(error="Search failed", total_count=0)
+
+        if output_mode == "files_only":
+            all_files = [f for f in result.stdout.strip().split("\n") if f]
+            total = len(all_files)
+            page = all_files[offset : offset + limit]
+            return SearchResult(files=page, total_count=total)
+
+        elif output_mode == "count":
+            counts = {}
+            for line in result.stdout.strip().split("\n"):
+                if ":" in line:
+                    parts = line.rsplit(":", 1)
+                    if len(parts) == 2:
+                        try:
+                            counts[parts[0]] = int(parts[1].strip())
+                        except ValueError:
+                            pass
+            return SearchResult(counts=counts, total_count=sum(counts.values()))
+
+        else:
+            matches = []
+            for line in result.stdout.strip().split("\n"):
+                if not line or line == "--":
+                    continue
+                m = re.match(r"^(\x1b\[[0-9;]*m)*(.+?)(\x1b\[[0-9;]*m)*:(\d+):(.*)", line)
+                if m:
+                    matches.append(SearchMatch(
+                        path=(m.group(1) or "") + m.group(2),
+                        line_number=int(m.group(4)),
+                        content=m.group(5)[:500],
+                    ))
+            total = len(matches)
+            page = matches[offset : offset + limit]
+            return SearchResult(matches=page, total_count=total,
+                                truncated=total > offset + limit)
+
+    def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
+                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+        """Content search: prefer rg, fallback to Python re."""
+        if self._has_command("rg"):
+            return self._search_with_rg(pattern, path, file_glob, limit, offset,
+                                        output_mode, context)
+        # No rg available — use Python-based grep fallback
+        return self._search_with_python(pattern, path, file_glob, limit, offset,
+                                        output_mode, context)
+
+    def _search_with_python(self, pattern: str, path: str, file_glob: Optional[str],
+                            limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+        """Pure-Python content search fallback for Windows without rg/grep."""
+        import fnmatch as _fnmatch
+
+        try:
+            regex = re.compile(pattern)
+        except re.error as e:
+            return SearchResult(error=f"Invalid regex pattern: {e}", total_count=0)
+
+        matches: list = []
+        file_counts: dict = {}
+        file_list: list = []
+        walk_root = path if os.path.isdir(path) else os.path.dirname(path) or "."
+
+        for root, dirs, files in os.walk(walk_root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                if file_glob and not _fnmatch.fnmatch(fname, file_glob):
+                    continue
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        for lineno, line in enumerate(f, 1):
+                            if regex.search(line):
+                                if output_mode == "files_only":
+                                    file_list.append(fpath)
+                                    break
+                                elif output_mode == "count":
+                                    file_counts[fpath] = file_counts.get(fpath, 0) + 1
+                                else:
+                                    matches.append(SearchMatch(
+                                        path=fpath,
+                                        line_number=lineno,
+                                        content=line.rstrip("\r\n")[:500],
+                                    ))
+                except (OSError, UnicodeDecodeError):
+                    continue
+
+        if output_mode == "files_only":
+            total = len(file_list)
+            page = file_list[offset : offset + limit]
+            return SearchResult(files=page, total_count=total)
+        elif output_mode == "count":
+            return SearchResult(counts=file_counts, total_count=sum(file_counts.values()))
+        else:
+            total = len(matches)
+            page = matches[offset : offset + limit]
+            return SearchResult(matches=page, total_count=total,
+                                truncated=total > offset + limit)
