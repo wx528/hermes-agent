@@ -157,11 +157,24 @@ class TestWrapCommand:
         wrapped = env._wrap_command("Write-Output hello", "C:/Users/test")
 
         assert "$ProgressPreference = 'SilentlyContinue'" in wrapped
+        assert "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8" in wrapped
+        assert "$OutputEncoding = [System.Text.Encoding]::UTF8" in wrapped
         assert "Set-Location -LiteralPath" in wrapped
         assert "Invoke-Expression $__cmd" in wrapped
         assert "$__hermes_ec" in wrapped
         assert "[IO.File]::WriteAllText" in wrapped
         assert "exit $__hermes_ec" in wrapped
+
+    def test_progress_preference_silenced(self):
+        env = self._make_env()
+        wrapped = env._wrap_command("ls", "C:/tmp")
+        assert "$ProgressPreference = 'SilentlyContinue'" in wrapped
+
+    def test_utf8_encoding_set(self):
+        env = self._make_env()
+        wrapped = env._wrap_command("ls", "C:/tmp")
+        assert "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8" in wrapped
+        assert "$OutputEncoding = [System.Text.Encoding]::UTF8" in wrapped
 
     def test_no_snapshot_skips_restore_and_dump(self):
         env = self._make_env()
@@ -631,24 +644,12 @@ class TestCleanup:
         env.cleanup()
 
     def test_ps1_file_cleaned(self, tmp_path):
-        env = _TestableWinEnv()
-        env._snapshot_path = str(tmp_path / "snap.txt")
-        env._cwd_file = str(tmp_path / "cwd.txt")
-
-        # Create the .ps1 temp file
-        ps1_path = os.path.join(env.get_temp_dir(), f"hermes-ps-{env._session_id}.ps1")
-        os.makedirs(os.path.dirname(ps1_path), exist_ok=True)
-        with open(ps1_path, "w") as f:
-            f.write("$ProgressPreference = 'SilentlyContinue'")
-
-        env.cleanup()
-        assert not os.path.exists(ps1_path)
+        pytest.skip("No longer creates .ps1 temp files — uses -Command instead")
 
 
 # ===================================================================
 # Integration tests (Windows only)
 # ===================================================================
-
 
 @pytest.mark.skipif(not _IS_WINDOWS, reason="Requires Windows PowerShell")
 class TestWindowsLocalIntegration:
@@ -751,12 +752,12 @@ class TestWindowsLocalIntegration:
         env._snapshot_path = str(tmp_path / "snap-crlf.txt")
 
         # Simulate what [IO.File]::WriteAllLines produces on Windows:
-        # each line ends with \\r\\n, and the separator is \\x02\\x03
-        content = f"PATH{_ENV_SEP}C:\\Windows;C:\\Users\\test\\r\\nFOO{_ENV_SEP}bar\\r\\n"
-        with open(env._snapshot_path, "w", encoding="utf-8") as f:
+        # each line ends with CRLF, and the separator is \x02\x03
+        content = f"PATH{_ENV_SEP}C:\\Windows;C:\\Users\\test\r\nFOO{_ENV_SEP}bar\r\n"
+        with open(env._snapshot_path, "w", encoding="utf-8", newline="") as f:
             f.write(content)
 
-        # _load_snapshot uses rstrip("\\n\\r") which strips the \\r
+        # _load_snapshot uses rstrip("\n\r") which strips the \r
         result = env._load_snapshot()
         assert result["PATH"] == r"C:\Windows;C:\Users\test"
         assert result["FOO"] == "bar"

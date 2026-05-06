@@ -4,6 +4,7 @@ Phase 2: direct PowerShell spawn with session snapshot (env var persistence).
 Env vars set via `$env:FOO = "bar"` or `set FOO=bar` persist across commands.
 """
 
+import base64
 import logging
 import os
 import platform
@@ -125,6 +126,8 @@ class WindowsLocalEnvironment(BaseEnvironment):
         quoted_snap = _quote_ps_literal(self._snapshot_path)
         bootstrap = (
             "$ProgressPreference = 'SilentlyContinue'\n"
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+            "$OutputEncoding = [System.Text.Encoding]::UTF8\n"
             # Dump all env vars as KEY\x00VALUE lines using BOM-free UTF-8 write.
             # Out-File -Encoding utf8 on PS5.1 adds a BOM and strips NUL chars,
             # which destroys the NUL separator — the exact bug that caused env
@@ -230,6 +233,12 @@ class WindowsLocalEnvironment(BaseEnvironment):
 
         ps_script = (
             f"$ProgressPreference = 'SilentlyContinue'\n"
+            # Force UTF-8 output encoding so Python's utf-8 decoder receives
+            # valid UTF-8 regardless of the system's active code page (e.g. GBK
+            # 936 on Chinese Windows).  Must be set before any output is
+            # written, including the CWD marker.
+            f"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+            f"$OutputEncoding = [System.Text.Encoding]::UTF8\n"
             # Override Get-Location / pwd to emit path string to stdout
             f"Remove-Item Alias:pwd -ErrorAction SilentlyContinue\n"
             f"function pwd {{ Write-Output (Microsoft.PowerShell.Management\\Get-Location).Path }}\n"
@@ -269,17 +278,24 @@ class WindowsLocalEnvironment(BaseEnvironment):
     ) -> subprocess.Popen:
         """Spawn PowerShell to run *cmd_string* (a PowerShell script).
 
-        Writes the script to a temporary .ps1 file so we don't have to fight
-        PowerShell's command-line quoting rules, then invokes it with
-        ``-NoProfile -NonInteractive -ExecutionPolicy Bypass -File <path>``.
+        Uses -EncodedCommand to avoid all quoting/escaping issues and to
+        bypass PowerShell 5.1's file-mode encoding bug (output is ANSI/OEM
+        instead of UTF-8 when using -File).
         """
         pwsh = _find_powershell()
         run_env = _sanitize_subprocess_env(os.environ, self.env)
 
-        temp_dir = self.get_temp_dir()
-        ps1_path = os.path.join(temp_dir, f"hermes-ps-{self._session_id}.ps1")
-        with open(ps1_path, "w", encoding="utf-8") as f:
-            f.write(cmd_string)
+        # Build the full script: UTF-8 preamble + user script.
+        # The preamble sets output encoding; the user script is executed as-is.
+        full_script = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\r\n"
+            "$OutputEncoding = [System.Text.Encoding]::UTF8\r\n"
+            + cmd_string
+        )
+
+        # Encode to UTF-16LE (PowerShell -EncodedCommand expects this).
+        encoded = full_script.encode("utf-16-le")
+        b64 = base64.b64encode(encoded).decode("ascii")
 
         args = [
             pwsh,
@@ -287,8 +303,10 @@ class WindowsLocalEnvironment(BaseEnvironment):
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-File",
-            ps1_path,
+            "-OutputFormat",
+            "Text",
+            "-EncodedCommand",
+            b64,
         ]
 
         proc = subprocess.Popen(
@@ -402,11 +420,3 @@ class WindowsLocalEnvironment(BaseEnvironment):
                     os.unlink(f)
             except OSError:
                 pass
-        # Also clean up the temporary .ps1 script.
-        temp_dir = self.get_temp_dir()
-        ps1_path = os.path.join(temp_dir, f"hermes-ps-{self._session_id}.ps1")
-        try:
-            if os.path.exists(ps1_path):
-                os.unlink(ps1_path)
-        except OSError:
-            pass
